@@ -1,0 +1,17 @@
+node_modules/
+__pycache__/
+bin/
+bundle/
+.data/
+.work/
+internal/web/dist/*
+!internal/web/dist/.gitkeep
+# Local planning, design and deployment notes
+docs/
+PRODUCT.md
+DESIGN.md
+.impeccable/
+.playwright-cli/
+*.zip
+.DS_Store
+.idea/

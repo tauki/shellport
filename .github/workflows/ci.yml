@@ -1,0 +1,67 @@
+name: Checks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Ensure terminal integration tests can run
+        shell: bash
+        run: |
+          packages=()
+          for executable in tmux tcsh; do
+            if ! command -v "$executable" >/dev/null 2>&1; then
+              packages+=("$executable")
+            fi
+          done
+          if (( ${#packages[@]} )); then
+            if [[ "$RUNNER_OS" == Linux ]]; then
+              sudo apt-get update
+              sudo apt-get install --yes "${packages[@]}"
+            else
+              brew install "${packages[@]}"
+            fi
+          fi
+          tmux -V
+          tcsh --version
+      - name: Install dependencies
+        run: |
+          npm ci
+          go mod download
+      - name: Build embedded web interface and server
+        run: make build
+      - name: Typecheck, race tests and vet
+        run: make test

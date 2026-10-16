@@ -1,0 +1,371 @@
+// Verify an existing installation through HTTP and a real terminal. The check
+// uses a disposable saved computer and session, leaving existing work untouched.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+type host struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Address     string `json:"address"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	Auth        string `json:"auth"`
+	Tmux        bool   `json:"tmux"`
+	Fingerprint string `json:"fingerprint"`
+}
+type connection struct {
+	ID         string `json:"id"`
+	Session    string `json:"session"`
+	SessionRef string `json:"sessionRef"`
+	Window     struct {
+		ID string `json:"id"`
+	} `json:"window"`
+}
+type credentials struct{ password, passphrase string }
+type options struct{ origin, passwordFile, hostID, hostName, expectArch, sshPasswordFile, passphraseFile string }
+
+var client *http.Client
+var base string
+
+func fail(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "smoke:", err)
+		os.Exit(1)
+	}
+}
+
+func privateValue(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 || st.Size() > 16<<10 {
+		return "", errors.New("credential files must be private regular files of at most 16 KiB")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("credential file must contain one nonempty line")
+	}
+	return value, nil
+}
+
+func request(method, path string, body, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(method, base+"/api"+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Origin", base)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+		return fmt.Errorf("%s: HTTP %d: %s", path, res.StatusCode, b)
+	}
+	if out != nil {
+		return json.NewDecoder(res.Body).Decode(out)
+	}
+	return nil
+}
+
+func chooseHost(hosts []host, id, name string) (host, error) {
+	if (id == "") == (name == "") {
+		return host{}, errors.New("provide exactly one of --host-id or --host-name")
+	}
+	var matches []host
+	for _, h := range hosts {
+		if id != "" && h.ID == id || name != "" && h.Name == name {
+			matches = append(matches, h)
+		}
+	}
+	if len(matches) == 0 {
+		return host{}, errors.New("saved computer not found")
+	}
+	if len(matches) != 1 {
+		return host{}, errors.New("computer name is ambiguous; choose --host-id")
+	}
+	if matches[0].Auth != "local" && matches[0].Fingerprint == "" {
+		return host{}, errors.New("verify the saved computer's SSH identity in Shellport first")
+	}
+	return matches[0], nil
+}
+
+func connect(ctx context.Context, h host, auth credentials, choice map[string]any) (*websocket.Conn, connection, error) {
+	input := map[string]any{"cols": 84, "rows": 24, "password": auth.password, "passphrase": auth.passphrase}
+	for key, value := range choice {
+		input[key] = value
+	}
+	var created connection
+	if err := request("POST", "/hosts/"+h.ID+"/connect", input, &created); err != nil {
+		return nil, created, err
+	}
+	socket, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(base, "http")+"/api/terminals/"+created.ID+"/terminal",
+		&websocket.DialOptions{HTTPClient: client, HTTPHeader: http.Header{"Origin": {base}}})
+	return socket, created, err
+}
+
+func await(ctx context.Context, socket *websocket.Conn, patterns ...*regexp.Regexp) (string, error) {
+	var output string
+	for {
+		kind, b, err := socket.Read(ctx)
+		if err != nil {
+			return "", err
+		}
+		if kind == websocket.MessageBinary {
+			output += string(b)
+		}
+		if len(output) > 1<<20 {
+			return "", errors.New("bounded terminal output exceeded before verification")
+		}
+		complete := true
+		for _, pattern := range patterns {
+			if !pattern.MatchString(output) {
+				complete = false
+			}
+		}
+		if complete {
+			return output, nil
+		}
+	}
+}
+func architecturePattern(marker string) *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(marker) + `([A-Za-z0-9_.-]{1,64})\r?\n`)
+}
+func sizePattern(marker string) *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(marker) + `([0-9]{1,3})[ \t]+([0-9]{1,3})\r?\n`)
+}
+
+// A PTY resize reaches tmux asynchronously. Sample the disposable shell until
+// its actual dimensions match, rather than treating an immediate stale read as
+// the final result. The marker and dimensions are generated by this tool.
+func resizedSizeCommand(marker string, rows, cols int) string {
+	return fmt.Sprintf("for shellport_resize_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do set -- $(stty size); if [ \"$#\" -eq 2 ] && [ \"$1\" -eq %d ] && [ \"$2\" -eq %d ]; then printf '%s%%s %%s\\n' \"$1\" \"$2\"; break; fi; sleep 0.1; done\n", rows, cols, marker)
+}
+
+func cleanupProbe(temporary host, session connection, auth credentials) error {
+	var failures []error
+	if temporary.ID != "" {
+		if session.Session != "" && session.SessionRef != "" {
+			if err := request("POST", "/hosts/"+temporary.ID+"/tmux-sessions/delete",
+				map[string]any{"session": session.Session, "ref": session.SessionRef, "confirm": true, "password": auth.password, "passphrase": auth.passphrase}, nil); err != nil {
+				failures = append(failures, fmt.Errorf("remove temporary session: %w", err))
+			}
+		}
+		if err := request("DELETE", "/hosts/"+temporary.ID, nil, nil); err != nil {
+			failures = append(failures, fmt.Errorf("remove temporary computer: %w", err))
+		}
+	}
+	if err := request("POST", "/logout", map[string]any{}, nil); err != nil {
+		failures = append(failures, fmt.Errorf("sign out: %w", err))
+	}
+	return errors.Join(failures...)
+}
+
+func run(o options) (receipt map[string]any, err error) {
+	if o.passwordFile == "" || (o.hostID == "") == (o.hostName == "") {
+		return nil, errors.New("--password-file and exactly one of --host-id or --host-name are required")
+	}
+	origin, err := url.Parse(strings.TrimSuffix(o.origin, "/"))
+	if err != nil || origin == nil || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" || origin.Scheme != "https" && origin.Scheme != "http" {
+		return nil, errors.New("--url must be an exact HTTP or HTTPS origin")
+	}
+	if origin.Scheme == "http" {
+		ip := net.ParseIP(origin.Hostname())
+		if origin.Hostname() != "localhost" && !strings.HasSuffix(origin.Hostname(), ".localhost") && (ip == nil || !ip.IsLoopback()) {
+			return nil, errors.New("use HTTPS outside loopback")
+		}
+	}
+	base = origin.String()
+	password, err := privateValue(o.passwordFile)
+	if err != nil {
+		return nil, err
+	}
+	sshPassword, err := privateValue(o.sshPasswordFile)
+	if err != nil {
+		return nil, err
+	}
+	passphrase, err := privateValue(o.passphraseFile)
+	if err != nil {
+		return nil, err
+	}
+	auth := credentials{sshPassword, passphrase}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	client = &http.Client{Jar: jar, Timeout: 25 * time.Second}
+	if err = request("POST", "/login", map[string]string{"password": password}, nil); err != nil {
+		return nil, err
+	}
+	var temporary host
+	var first connection
+	defer func() { err = errors.Join(err, cleanupProbe(temporary, first, auth)) }()
+	var hosts []host
+	if err = request("GET", "/hosts", nil, &hosts); err != nil {
+		return nil, err
+	}
+	target, err := chooseHost(hosts, o.hostID, o.hostName)
+	if err != nil {
+		return nil, err
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err = rand.Read(tokenBytes); err != nil {
+		return nil, err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	probeName := "smoke-" + token
+	if err = request("POST", "/hosts", map[string]any{"name": probeName, "address": target.Address, "port": target.Port, "username": target.Username, "auth": target.Auth, "tmux": target.Tmux}, &temporary); err != nil {
+		return nil, err
+	}
+	if target.Auth != "local" {
+		var probe struct {
+			Fingerprint string `json:"fingerprint"`
+		}
+		if err = request("POST", "/hosts/"+temporary.ID+"/probe", map[string]any{}, &probe); err != nil {
+			return nil, err
+		}
+		if probe.Fingerprint != target.Fingerprint {
+			return nil, errors.New("SSH identity differs from the already-verified saved computer")
+		}
+		if err = request("POST", "/hosts/"+temporary.ID+"/trust", map[string]string{"fingerprint": target.Fingerprint}, nil); err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	choice := map[string]any{}
+	if target.Tmux {
+		choice = map[string]any{"session": probeName, "create": true}
+	}
+	socket, first, err := connect(ctx, temporary, auth, choice)
+	if err != nil {
+		return nil, err
+	}
+	defer socket.CloseNow()
+	if target.Tmux && (first.Session != probeName || first.SessionRef == "" || first.Window.ID == "") {
+		return nil, errors.New("server did not return the disposable session and tab identity")
+	}
+	archMarker := "__SHELLPORT_ARCH_" + token + "="
+	sizeMarker := "__SHELLPORT_SIZE_" + token + "="
+	resizeMarker := "__SHELLPORT_RESIZE_" + token + "="
+	command := "SHELLPORT_PROBE_TOKEN=" + token + "; printf '" + archMarker + "'; uname -m; printf '" + sizeMarker + "'; stty size\n"
+	if err = socket.Write(ctx, websocket.MessageBinary, []byte(command)); err != nil {
+		return nil, err
+	}
+	archPattern, dimensionsPattern := architecturePattern(archMarker), sizePattern(sizeMarker)
+	output, err := await(ctx, socket, archPattern, dimensionsPattern)
+	if err != nil {
+		return nil, err
+	}
+	architecture := archPattern.FindStringSubmatch(output)[1]
+	dimensions := dimensionsPattern.FindStringSubmatch(output)
+	rows, _ := strconv.Atoi(dimensions[1])
+	cols, _ := strconv.Atoi(dimensions[2])
+	if rows < 1 || rows > 24 || cols != 84 {
+		return nil, errors.New("terminal did not use the requested initial size")
+	}
+	if o.expectArch != "" && architecture != o.expectArch {
+		return nil, fmt.Errorf("reported architecture %q differs from --expect-arch %q", architecture, o.expectArch)
+	}
+	if err = socket.Write(ctx, websocket.MessageText, []byte(`{"type":"resize","cols":96,"rows":32}`)); err != nil {
+		return nil, err
+	}
+	if err = socket.Write(ctx, websocket.MessageBinary, []byte(resizedSizeCommand(resizeMarker, rows+8, 96))); err != nil {
+		return nil, err
+	}
+	// Preserve the observed status-bar offset instead of assuming tmux's layout.
+	resizedPattern := regexp.MustCompile(regexp.QuoteMeta(resizeMarker) + fmt.Sprintf(`%d[ \t]+96\r?\n`, rows+8))
+	if _, err = await(ctx, socket, resizedPattern); err != nil {
+		return nil, err
+	}
+	if err = socket.Close(websocket.StatusNormalClosure, "smoke detach"); err != nil {
+		return nil, err
+	}
+	persistent := false
+	if target.Tmux {
+		again, resumed, err := connect(ctx, temporary, auth, map[string]any{"session": first.Session, "sessionRef": first.SessionRef, "window": first.Window.ID})
+		if err != nil {
+			return nil, err
+		}
+		defer again.CloseNow()
+		if resumed.SessionRef != first.SessionRef || resumed.Window.ID != first.Window.ID {
+			return nil, errors.New("reconnect selected a different session or tab")
+		}
+		if err = again.Write(ctx, websocket.MessageBinary, []byte("printf '__SHELLPORT_RETURN_%s__\\n' \"$SHELLPORT_PROBE_TOKEN\"\n")); err != nil {
+			return nil, err
+		}
+		returnPattern := regexp.MustCompile(regexp.QuoteMeta("__SHELLPORT_RETURN_"+token+"__") + `\r?\n`)
+		if _, err = await(ctx, again, returnPattern); err != nil {
+			return nil, err
+		}
+		persistent = true
+		if err = again.Close(websocket.StatusNormalClosure, "smoke complete"); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{"checkedAt": time.Now().UTC().Format(time.RFC3339), "url": base, "host": target.Name, "architecture": architecture,
+		"interactiveShell": true, "terminalResize": true, "tmuxResume": persistent, "logout": true, "temporaryResourcesRemoved": true}, nil
+}
+
+func main() {
+	var o options
+	flag.StringVar(&o.origin, "url", "", "existing Shellport origin")
+	flag.StringVar(&o.passwordFile, "password-file", "", "private app-password file")
+	flag.StringVar(&o.hostID, "host-id", "", "saved computer ID; choose this or --host-name")
+	flag.StringVar(&o.hostName, "host-name", "", "unique saved computer name; choose this or --host-id")
+	flag.StringVar(&o.expectArch, "expect-arch", "", "optional exact uname -m result to require")
+	flag.StringVar(&o.sshPasswordFile, "ssh-password-file", "", "optional private SSH password file")
+	flag.StringVar(&o.passphraseFile, "key-passphrase-file", "", "optional private SSH key-passphrase file")
+	receiptPath := flag.String("receipt", "", "optional new private JSON proof file")
+	flag.Parse()
+	if flag.NArg() != 0 {
+		fail(errors.New("unexpected positional arguments"))
+	}
+	receipt, err := run(o)
+	fail(err)
+	data, err := json.MarshalIndent(receipt, "", "  ")
+	fail(err)
+	if *receiptPath != "" {
+		file, err := os.OpenFile(*receiptPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		fail(err)
+		_, writeErr := file.Write(append(data, '\n'))
+		fail(errors.Join(writeErr, file.Close()))
+	}
+	fmt.Println(string(data))
+}
